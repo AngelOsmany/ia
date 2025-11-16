@@ -10,6 +10,12 @@ class HuggingFaceService {
   static const String _token = String.fromEnvironment('HF_TOKEN', defaultValue: '');
   static const String _corsProxy = String.fromEnvironment('CORS_PROXY', defaultValue: '');
   static const String _spaceUrl = String.fromEnvironment('HF_SPACE_URL', defaultValue: '');
+  // Optional generic API endpoints (allow plugging any public/no-auth API)
+  static const String _chatUrl = String.fromEnvironment('AI_CHAT_URL', defaultValue: '');
+  static const String _imageUrl = String.fromEnvironment('AI_IMAGE_URL', defaultValue: '');
+  static const String _sentimentUrl = String.fromEnvironment('AI_SENTIMENT_URL', defaultValue: '');
+  // Optional extra headers in JSON form, e.g. --dart-define=AI_API_HEADERS='{"Authorization":"Bearer ..."}'
+  static const String _apiHeadersJson = String.fromEnvironment('AI_API_HEADERS', defaultValue: '');
 
   static Map<String, String> get _headers {
     final headers = <String, String>{
@@ -26,6 +32,19 @@ class HuggingFaceService {
   // - Query-style proxies that expect the target appended after a `?`, e.g. `https://corsproxy.io/?`
   // - JSON proxy endpoint that expects { url: target, data: ..., headers: ... } (our FastAPI proxy)
   static Future<http.Response> _postToTarget(String target, dynamic payload) async {
+    // allow user-provided headers (overrides default headers)
+    final Map<String, String> extraHeaders = {};
+    if (_apiHeadersJson.isNotEmpty) {
+      try {
+        final parsed = json.decode(_apiHeadersJson);
+        if (parsed is Map) {
+          parsed.forEach((k, v) {
+            if (k != null && v != null) extraHeaders[k.toString()] = v.toString();
+          });
+        }
+      } catch (_) {}
+    }
+
     if (_corsProxy.isNotEmpty) {
       // If proxy appears to be a query-style proxy (contains '?'), append encoded target
       if (_corsProxy.contains('?')) {
@@ -37,17 +56,37 @@ class HuggingFaceService {
       final proxyBody = {
         'url': target,
         'data': payload,
-        'headers': _headers,
+        'headers': {..._headers, ...extraHeaders},
       };
       return await http.post(Uri.parse(_corsProxy), headers: {'Content-Type': 'application/json'}, body: json.encode(proxyBody));
     }
 
     // No proxy: call target directly
-    return await http.post(Uri.parse(target), headers: _headers, body: json.encode(payload));
+    return await http.post(Uri.parse(target), headers: {..._headers, ...extraHeaders}, body: json.encode(payload));
   }
 
   // CHAT REAL - Con manejo de HF Space, token y fallback mock
   static Future<String> generateText(String prompt) async {
+    // If custom chat API URL provided, use it first.
+    if (_chatUrl.isNotEmpty) {
+      try {
+        final response = await _postToTarget(_chatUrl, {'inputs': prompt}).timeout(const Duration(seconds: 30));
+        if (response.statusCode == 200) {
+          try {
+            final data = json.decode(response.body);
+            if (data is Map && data.containsKey('generated_text')) return data['generated_text'].toString();
+            if (data is Map && data.containsKey('data')) {
+              final d = data['data'];
+              if (d is List && d.isNotEmpty) return d[0].toString();
+            }
+          } catch (_) {}
+          return response.body;
+        }
+        return 'Error: chat API returned ${response.statusCode}';
+      } catch (e) {
+        // fall through to other methods
+      }
+    }
     // If an HF Space URL is provided, call it (many public Spaces accept {"data":[input]})
     if (_spaceUrl.isNotEmpty) {
       try {
@@ -68,10 +107,8 @@ class HuggingFaceService {
       try {
         final target = '$_baseUrl/microsoft/DialoGPT-medium';
         if (kIsWeb && _corsProxy.isEmpty) {
-          return '🔒 En navegador (web) las peticiones a la API pueden bloquearse por CORS.\n\n' 
-                 'Opciones:\n' 
-                 '• Ejecuta la app en Android/iOS donde funciona la API.\n' 
-                 '• Provee un proxy CORS seguro y vuelve a compilar con: --dart-define=CORS_PROXY=https://your-proxy/' ;
+          // On web without a proxy, fallback to mock to avoid exposing CORS messages in UI.
+          return _mockChatResponse(prompt);
         }
 
         final response = await _postToTarget(target, {
@@ -104,6 +141,31 @@ class HuggingFaceService {
 
   // GENERACIÓN DE IMÁGENES REAL con visualización (soporta HF Space, token y mock)
   static Future<List<String>> generateImage(String prompt) async {
+    // If custom image API URL provided, use it first.
+    if (_imageUrl.isNotEmpty) {
+      try {
+        final response = await _postToTarget(_imageUrl, {'inputs': prompt}).timeout(const Duration(seconds: 60));
+        if (response.statusCode == 200) {
+          final contentType = response.headers['content-type'] ?? '';
+          if (contentType.startsWith('image/')) {
+            final base64Image = base64Encode(response.bodyBytes);
+            return ['data:$contentType;base64,$base64Image'];
+          }
+          try {
+            final decoded = json.decode(response.body);
+            if (decoded is Map && decoded.containsKey('images')) {
+              final imgs = decoded['images'];
+              if (imgs is List && imgs.isNotEmpty) return ['data:image/png;base64,${imgs[0]}'];
+            }
+            if (decoded is List && decoded.isNotEmpty && decoded[0] is String) return ['data:image/png;base64,${decoded[0]}'];
+          } catch (_) {}
+          return ['${response.body}'];
+        }
+        return ['Error: image API returned ${response.statusCode}'];
+      } catch (e) {
+        // fall through
+      }
+    }
     // Try HF Space first
     if (_spaceUrl.isNotEmpty) {
       try {
@@ -124,8 +186,8 @@ class HuggingFaceService {
       try {
         final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
         if (kIsWeb && _corsProxy.isEmpty) {
-          return ['🔒 En navegador (web) las peticiones a modelos de imágenes suelen bloquearse por CORS.\n' 
-                  'Provee un proxy con --dart-define=CORS_PROXY=http://localhost:7860/proxy o ejecuta en Android/iOS.'];
+          // When running on web without proxy, return mock image to avoid UI error spam.
+          return _mockImageResponse(prompt);
         }
 
         final response = await _postToTarget(target, {
@@ -208,6 +270,23 @@ class HuggingFaceService {
 
   // ANÁLISIS DE SENTIMIENTOS REAL
   static Future<String> analyzeSentiment(String text) async {
+    // If custom sentiment API URL provided, use it first.
+    if (_sentimentUrl.isNotEmpty) {
+      try {
+        final response = await _postToTarget(_sentimentUrl, {'inputs': text}).timeout(const Duration(seconds: 30));
+        if (response.statusCode == 200) {
+          try {
+            final data = json.decode(response.body);
+            return _parseSentiment(data);
+          } catch (_) {
+            return response.body;
+          }
+        }
+        return 'Error: sentiment API returned ${response.statusCode}';
+      } catch (e) {
+        // fall through
+      }
+    }
     // Try HF Space first
     if (_spaceUrl.isNotEmpty) {
       try {
@@ -225,22 +304,12 @@ class HuggingFaceService {
     if (_token.isNotEmpty) {
       try {
         final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
+        // If running on web without proxy, use mock to avoid surfacing CORS notices.
         if (kIsWeb && _corsProxy.isEmpty) {
-          return '🔒 En navegador (web) el análisis puede bloquearse por CORS.\n' 
-                 'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.';
+          return _mockSentimentResponse(text);
         }
 
-        final url = kIsWeb && _corsProxy.isNotEmpty
-            ? '$_corsProxy${Uri.encodeFull(target)}'
-            : target;
-
-        final response = await http.post(
-          Uri.parse(url),
-          headers: _headers,
-          body: json.encode({
-            'inputs': text,
-          }),
-        ).timeout(const Duration(seconds: 30));
+        final response = await _postToTarget(target, {'inputs': text}).timeout(const Duration(seconds: 30));
 
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
@@ -294,7 +363,7 @@ class HuggingFaceService {
 
     // Mock/demo helpers used when no token/space is provided (useful for web demos)
     static String _mockChatResponse(String prompt) {
-      return '🤖 (demo) Respuesta de ejemplo para: "$prompt"\n\nPuedes ejecutar en Android con un token real o configurar HF_SPACE_URL para usar un Space público.';
+        return '🤖 (demo) Respuesta de ejemplo para: "$prompt"';
     }
 
     static List<String> _mockImageResponse(String prompt) {

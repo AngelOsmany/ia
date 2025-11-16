@@ -48,6 +48,28 @@ flutter run -d chrome --dart-define=CORS_PROXY=http://127.0.0.1:7860/proxy
 
 The service `lib/services/huggingface_service.dart` detects `CORS_PROXY` and routes requests through the proxy (supports both query-style proxies like `https://corsproxy.io/?` and our JSON `/proxy` endpoint).
 
+Provide your own AI API (optional)
+---------------------------------
+
+If you want to use another AI API (free public Space, alternative model endpoint, or your own server), set one or more of the following at compile/run time using `--dart-define`:
+
+- `AI_CHAT_URL` — full URL that accepts a POST JSON payload like `{"inputs": "..."}` and returns either `{"generated_text": "..."}`, or `{"data": ["..."]}`.
+- `AI_IMAGE_URL` — full URL for image generation that accepts `{"inputs":"..."}` and returns either binary image content (proxy will base64 it) or JSON with `images` array.
+- `AI_SENTIMENT_URL` — URL that accepts `{"inputs":"..."}` and returns the typical HF inference sentiment list (e.g. `[{"label":"POSITIVE","score":...}, ...]`) or similar JSON.
+- `AI_API_HEADERS` — optional JSON string of headers to add to requests (useful if an API requires a key or custom header). Example: `--dart-define=AI_API_HEADERS={"Authorization":"Bearer ..."}` (ensure proper escaping for your shell).
+
+Examples:
+
+```powershell
+# Use a Hugging Face Space endpoint for chat
+flutter run -d chrome --dart-define=AI_CHAT_URL=https://<owner>-<space>.hf.space/api/predict
+
+# Provide custom headers (PowerShell escaping example)
+flutter run -d chrome --dart-define=AI_CHAT_URL=https://<space>.hf.space/api/predict --dart-define="AI_API_HEADERS={\"Authorization\":\"Bearer TOKEN\"}"
+```
+
+If none of `AI_*` URLs are provided, the app will try `HF_SPACE_URL`, then the HF Inference API with `HF_TOKEN` (requires a token), and finally fall back to a demo/mock mode.
+
 Running on Android
 ------------------
 
