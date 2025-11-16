@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
+import 'runtime_config.dart';
 
 class HuggingFaceService {
   static const String _baseUrl = 'https://api-inference.huggingface.co/models';
@@ -17,26 +18,23 @@ class HuggingFaceService {
   // Optional extra headers in JSON form, e.g. --dart-define=AI_API_HEADERS='{"Authorization":"Bearer ..."}'
   static const String _apiHeadersJson = String.fromEnvironment('AI_API_HEADERS', defaultValue: '');
 
-  static Map<String, String> get _headers {
-    final headers = <String, String>{
-      'Content-Type': 'application/json',
-    };
-    if (_token.isNotEmpty) {
-      headers['Authorization'] = 'Bearer $_token';
-    }
-    return headers;
-  }
+  // Note: headers are built per-request in _postToTarget (to allow runtime overrides)
 
   // Helper to POST to a target URL, routing through a proxy endpoint if configured.
   // Supports two proxy styles:
   // - Query-style proxies that expect the target appended after a `?`, e.g. `https://corsproxy.io/?`
   // - JSON proxy endpoint that expects { url: target, data: ..., headers: ... } (our FastAPI proxy)
-  static Future<http.Response> _postToTarget(String target, dynamic payload) async {
+  static Future<http.Response> _postToTarget(String target, dynamic payload,
+      {String? proxyOverride, String? apiHeadersJsonOverride, String? tokenOverride}) async {
     // allow user-provided headers (overrides default headers)
     final Map<String, String> extraHeaders = {};
-    if (_apiHeadersJson.isNotEmpty) {
+    final apiHeadersJsonLocal = apiHeadersJsonOverride ?? _apiHeadersJson;
+    final proxyLocal = proxyOverride ?? _corsProxy;
+    final tokenLocal = tokenOverride ?? _token;
+
+    if (apiHeadersJsonLocal.isNotEmpty) {
       try {
-        final parsed = json.decode(_apiHeadersJson);
+        final parsed = json.decode(apiHeadersJsonLocal);
         if (parsed is Map) {
           parsed.forEach((k, v) {
             if (k != null && v != null) extraHeaders[k.toString()] = v.toString();
@@ -45,32 +43,50 @@ class HuggingFaceService {
       } catch (_) {}
     }
 
-    if (_corsProxy.isNotEmpty) {
+    // Build headers merging static headers, token override and extra headers
+    final headers = <String, String>{'Content-Type': 'application/json'};
+    if (tokenLocal.isNotEmpty) headers['Authorization'] = 'Bearer $tokenLocal';
+    headers.addAll(extraHeaders);
+
+    if (proxyLocal.isNotEmpty) {
       // If proxy appears to be a query-style proxy (contains '?'), append encoded target
-      if (_corsProxy.contains('?')) {
-        final url = '$_corsProxy${Uri.encodeFull(target)}';
-        return await http.post(Uri.parse(url), headers: _headers, body: json.encode(payload));
+      if (proxyLocal.contains('?')) {
+        final url = '$proxyLocal${Uri.encodeFull(target)}';
+        return await http.post(Uri.parse(url), headers: headers, body: json.encode(payload));
       }
 
       // Otherwise assume it's a JSON proxy endpoint (like our FastAPI /proxy)
       final proxyBody = {
         'url': target,
         'data': payload,
-        'headers': {..._headers, ...extraHeaders},
+        'headers': headers,
       };
-      return await http.post(Uri.parse(_corsProxy), headers: {'Content-Type': 'application/json'}, body: json.encode(proxyBody));
+      return await http.post(Uri.parse(proxyLocal), headers: {'Content-Type': 'application/json'}, body: json.encode(proxyBody));
     }
 
     // No proxy: call target directly
-    return await http.post(Uri.parse(target), headers: {..._headers, ...extraHeaders}, body: json.encode(payload));
+    return await http.post(Uri.parse(target), headers: headers, body: json.encode(payload));
   }
 
   // CHAT REAL - Con manejo de HF Space, token y fallback mock
   static Future<String> generateText(String prompt) async {
+    // allow runtime overrides from SharedPreferences
+    final rtChat = await RuntimeConfig.get('AI_CHAT_URL');
+    final rtToken = await RuntimeConfig.get('HF_TOKEN');
+    final rtProxy = await RuntimeConfig.get('CORS_PROXY');
+    final rtApiHeaders = await RuntimeConfig.get('AI_API_HEADERS');
+    final chatUrl = (rtChat != null && rtChat.isNotEmpty) ? rtChat : _chatUrl;
+    final token = (rtToken != null && rtToken.isNotEmpty) ? rtToken : _token;
+    final proxy = (rtProxy != null && rtProxy.isNotEmpty) ? rtProxy : _corsProxy;
+    final apiHeadersJson = (rtApiHeaders != null && rtApiHeaders.isNotEmpty) ? rtApiHeaders : _apiHeadersJson;
+
+    // local copies for this call
+    
     // If custom chat API URL provided, use it first.
-    if (_chatUrl.isNotEmpty) {
+    if (chatUrl.isNotEmpty) {
       try {
-        final response = await _postToTarget(_chatUrl, {'inputs': prompt}).timeout(const Duration(seconds: 30));
+        // call custom chat API with runtime overrides
+        final response = await _postToTarget(chatUrl, {'inputs': prompt}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 30));
         if (response.statusCode == 200) {
           try {
             final data = json.decode(response.body);
@@ -118,7 +134,7 @@ class HuggingFaceService {
             'temperature': 0.9,
             'do_sample': true,
           }
-        }).timeout(const Duration(seconds: 30));
+        }, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 30));
 
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
@@ -141,10 +157,20 @@ class HuggingFaceService {
 
   // GENERACIÓN DE IMÁGENES REAL con visualización (soporta HF Space, token y mock)
   static Future<List<String>> generateImage(String prompt) async {
+    // allow runtime overrides
+    final rtImage = await RuntimeConfig.get('AI_IMAGE_URL');
+    final rtToken = await RuntimeConfig.get('HF_TOKEN');
+    final rtProxy = await RuntimeConfig.get('CORS_PROXY');
+    final rtApiHeaders = await RuntimeConfig.get('AI_API_HEADERS');
+    final imageUrl = (rtImage != null && rtImage.isNotEmpty) ? rtImage : _imageUrl;
+    final token = (rtToken != null && rtToken.isNotEmpty) ? rtToken : _token;
+    final proxy = (rtProxy != null && rtProxy.isNotEmpty) ? rtProxy : _corsProxy;
+    final apiHeadersJson = (rtApiHeaders != null && rtApiHeaders.isNotEmpty) ? rtApiHeaders : _apiHeadersJson;
+
     // If custom image API URL provided, use it first.
-    if (_imageUrl.isNotEmpty) {
+    if (imageUrl.isNotEmpty) {
       try {
-        final response = await _postToTarget(_imageUrl, {'inputs': prompt}).timeout(const Duration(seconds: 60));
+        final response = await _postToTarget(imageUrl, {'inputs': prompt}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 60));
         if (response.statusCode == 200) {
           final contentType = response.headers['content-type'] ?? '';
           if (contentType.startsWith('image/')) {
@@ -182,7 +208,7 @@ class HuggingFaceService {
     }
 
     // If token exists, call HF inference API
-    if (_token.isNotEmpty) {
+    if (token.isNotEmpty) {
       try {
         final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
         if (kIsWeb && _corsProxy.isEmpty) {
@@ -195,7 +221,7 @@ class HuggingFaceService {
           'parameters': {
             'num_inference_steps': 20,
           }
-        }).timeout(const Duration(seconds: 60));
+        }, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 60));
 
         if (response.statusCode == 200) {
           final contentType = response.headers['content-type'] ?? '';
@@ -236,8 +262,16 @@ class HuggingFaceService {
   // Imágenes con proxy CORS
   static Future<List<String>> _generateImageWithProxy(String prompt) async {
     try {
+      // runtime overrides
+      final rtToken = await RuntimeConfig.get('HF_TOKEN');
+      final rtProxy = await RuntimeConfig.get('CORS_PROXY');
+      final rtApiHeaders = await RuntimeConfig.get('AI_API_HEADERS');
+      final token = (rtToken != null && rtToken.isNotEmpty) ? rtToken : _token;
+      final proxy = (rtProxy != null && rtProxy.isNotEmpty) ? rtProxy : _corsProxy;
+      final apiHeadersJson = (rtApiHeaders != null && rtApiHeaders.isNotEmpty) ? rtApiHeaders : _apiHeadersJson;
+
       final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
-      final response = await _postToTarget(target, {'inputs': prompt}).timeout(const Duration(seconds: 60));
+      final response = await _postToTarget(target, {'inputs': prompt}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 60));
 
       if (response.statusCode == 200) {
         final contentType = response.headers['content-type'] ?? '';
@@ -270,10 +304,20 @@ class HuggingFaceService {
 
   // ANÁLISIS DE SENTIMIENTOS REAL
   static Future<String> analyzeSentiment(String text) async {
+    // runtime overrides
+    final rtSent = await RuntimeConfig.get('AI_SENTIMENT_URL');
+    final rtToken = await RuntimeConfig.get('HF_TOKEN');
+    final rtProxy = await RuntimeConfig.get('CORS_PROXY');
+    final rtApiHeaders = await RuntimeConfig.get('AI_API_HEADERS');
+    final sentimentUrl = (rtSent != null && rtSent.isNotEmpty) ? rtSent : _sentimentUrl;
+    final token = (rtToken != null && rtToken.isNotEmpty) ? rtToken : _token;
+    final proxy = (rtProxy != null && rtProxy.isNotEmpty) ? rtProxy : _corsProxy;
+    final apiHeadersJson = (rtApiHeaders != null && rtApiHeaders.isNotEmpty) ? rtApiHeaders : _apiHeadersJson;
+
     // If custom sentiment API URL provided, use it first.
-    if (_sentimentUrl.isNotEmpty) {
+    if (sentimentUrl.isNotEmpty) {
       try {
-        final response = await _postToTarget(_sentimentUrl, {'inputs': text}).timeout(const Duration(seconds: 30));
+        final response = await _postToTarget(sentimentUrl, {'inputs': text}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 30));
         if (response.statusCode == 200) {
           try {
             final data = json.decode(response.body);
@@ -301,7 +345,7 @@ class HuggingFaceService {
       } catch (_) {}
     }
 
-    if (_token.isNotEmpty) {
+    if (token.isNotEmpty) {
       try {
         final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
         // If running on web without proxy, use mock to avoid surfacing CORS notices.
@@ -309,7 +353,7 @@ class HuggingFaceService {
           return _mockSentimentResponse(text);
         }
 
-        final response = await _postToTarget(target, {'inputs': text}).timeout(const Duration(seconds: 30));
+        final response = await _postToTarget(target, {'inputs': text}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 30));
 
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
@@ -329,8 +373,15 @@ class HuggingFaceService {
   // Sentimientos con proxy CORS
   static Future<String> _analyzeSentimentWithProxy(String text) async {
     try {
+      final rtToken = await RuntimeConfig.get('HF_TOKEN');
+      final rtProxy = await RuntimeConfig.get('CORS_PROXY');
+      final rtApiHeaders = await RuntimeConfig.get('AI_API_HEADERS');
+      final token = (rtToken != null && rtToken.isNotEmpty) ? rtToken : _token;
+      final proxy = (rtProxy != null && rtProxy.isNotEmpty) ? rtProxy : _corsProxy;
+      final apiHeadersJson = (rtApiHeaders != null && rtApiHeaders.isNotEmpty) ? rtApiHeaders : _apiHeadersJson;
+
       final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
-      final response = await _postToTarget(target, {'inputs': text}).timeout(const Duration(seconds: 30));
+      final response = await _postToTarget(target, {'inputs': text}, proxyOverride: proxy, apiHeadersJsonOverride: apiHeadersJson, tokenOverride: token).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
