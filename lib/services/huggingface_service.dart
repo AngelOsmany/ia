@@ -5,10 +5,11 @@ import 'package:http/http.dart' as http;
 class HuggingFaceService {
   static const String _baseUrl = 'https://api-inference.huggingface.co/models';
 
-  // Read token and optional proxy from compile-time environment to avoid hardcoding
-  // Use: flutter run -d chrome --dart-define=HF_TOKEN=your_token --dart-define=CORS_PROXY=https://your-proxy/
+  // Read token, optional proxy and optional HF Space URL from compile-time environment
+  // Use: flutter run -d chrome --dart-define=HF_TOKEN=your_token --dart-define=CORS_PROXY=https://your-proxy/ --dart-define=HF_SPACE_URL=https://hf.space/embed/owner/space/api/predict
   static const String _token = String.fromEnvironment('HF_TOKEN', defaultValue: '');
   static const String _corsProxy = String.fromEnvironment('CORS_PROXY', defaultValue: '');
+  static const String _spaceUrl = String.fromEnvironment('HF_SPACE_URL', defaultValue: '');
 
   static Map<String, String> get _headers {
     final headers = <String, String>{
@@ -20,48 +21,66 @@ class HuggingFaceService {
     return headers;
   }
 
-  // CHAT REAL - Con manejo de CORS para web
+  // CHAT REAL - Con manejo de HF Space, token y fallback mock
   static Future<String> generateText(String prompt) async {
-    try {
-      final target = '$_baseUrl/microsoft/DialoGPT-medium';
-      if (kIsWeb && _corsProxy.isEmpty) {
-        return '🔒 En navegador (web) las peticiones a la API pueden bloquearse por CORS.\n\n' 
-               'Opciones:\n' 
-               '• Ejecuta la app en Android/iOS donde funciona la API.\n' 
-               '• Provee un proxy CORS seguro y vuelve a compilar con: --dart-define=CORS_PROXY=https://your-proxy/?url=';
-      }
-
-      final url = kIsWeb && _corsProxy.isNotEmpty
-          ? '$_corsProxy${Uri.encodeFull(target)}'
-          : target;
-
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': prompt,
-          'parameters': {
-            'max_length': 100,
-            'temperature': 0.9,
-            'do_sample': true,
+    // If an HF Space URL is provided, call it (many public Spaces accept {"data":[input]})
+    if (_spaceUrl.isNotEmpty) {
+      try {
+        final resp = await _callSpace(_spaceUrl, [prompt]);
+        if (resp is Map && resp.containsKey('data')) {
+          final data = resp['data'];
+          if (data is List && data.isNotEmpty) {
+            final first = data[0];
+            if (first is String) return first;
+            if (first is Map && first.containsKey('generated_text')) return first['generated_text'].toString();
           }
-        }),
-      ).timeout(const Duration(seconds: 30));
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        return data['generated_text'] ?? '🤖: ¿En qué más puedo ayudarte?';
-      } 
-      else if (response.statusCode == 503) {
-        return '⏳ El modelo de chat se está cargando. Esto es normal en el primer uso. Espera 20-30 segundos y vuelve a intentar.';
-      }
-      else {
-        return '❌ Error del servidor: ${response.statusCode}. Intenta nuevamente.';
-      }
-    } catch (e) {
-      // Para web, intentamos con proxy CORS
-      return await _generateTextWithProxy(prompt);
+        }
+      } catch (_) {}
     }
+
+    // If token exists, call HF inference API
+    if (_token.isNotEmpty) {
+      try {
+        final target = '$_baseUrl/microsoft/DialoGPT-medium';
+        if (kIsWeb && _corsProxy.isEmpty) {
+          return '🔒 En navegador (web) las peticiones a la API pueden bloquearse por CORS.\n\n' 
+                 'Opciones:\n' 
+                 '• Ejecuta la app en Android/iOS donde funciona la API.\n' 
+                 '• Provee un proxy CORS seguro y vuelve a compilar con: --dart-define=CORS_PROXY=https://your-proxy/?url=';
+        }
+
+        final url = kIsWeb && _corsProxy.isNotEmpty
+            ? '$_corsProxy${Uri.encodeFull(target)}'
+            : target;
+
+        final response = await http.post(
+          Uri.parse(url),
+          headers: _headers,
+          body: json.encode({
+            'inputs': prompt,
+            'parameters': {
+              'max_length': 100,
+              'temperature': 0.9,
+              'do_sample': true,
+            }
+          }),
+        ).timeout(const Duration(seconds: 30));
+
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          return data['generated_text'] ?? '🤖: ¿En qué más puedo ayudarte?';
+        } else if (response.statusCode == 503) {
+          return '⏳ El modelo de chat se está cargando. Esto es normal en el primer uso. Espera 20-30 segundos y vuelve a intentar.';
+        } else {
+          return '❌ Error del servidor: ${response.statusCode}. Intenta nuevamente.';
+        }
+      } catch (e) {
+        return '🔌 Error de conexión: $e';
+      }
+    }
+
+    // Fallback: mock/demo mode
+    return _mockChatResponse(prompt);
   }
 
   // Chat con proxy CORS para web
@@ -99,66 +118,81 @@ class HuggingFaceService {
     }
   }
 
-  // GENERACIÓN DE IMÁGENES REAL con visualización
+  // GENERACIÓN DE IMÁGENES REAL con visualización (soporta HF Space, token y mock)
   static Future<List<String>> generateImage(String prompt) async {
-    try {
-      final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
-      if (kIsWeb && _corsProxy.isEmpty) {
-        return ['🔒 En navegador (web) las peticiones a modelos de imágenes suelen bloquearse por CORS.\n' 
-                'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.'];
-      }
-
-      final url = kIsWeb && _corsProxy.isNotEmpty
-          ? '$_corsProxy${Uri.encodeFull(target)}'
-          : target;
-
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': prompt,
-          'parameters': {
-            'num_inference_steps': 20,
+    // Try HF Space first
+    if (_spaceUrl.isNotEmpty) {
+      try {
+        final resp = await _callSpace(_spaceUrl, [prompt]);
+        if (resp is Map && resp.containsKey('data')) {
+          final data = resp['data'];
+          if (data is List && data.isNotEmpty) {
+            final first = data[0];
+            if (first is String && first.startsWith('data:')) return [first];
+            if (first is String) return ['data:image/png;base64,$first'];
           }
-        }),
-      ).timeout(const Duration(seconds: 60));
+        }
+      } catch (_) {}
+    }
 
-      if (response.statusCode == 200) {
-        // If the API returns raw image bytes
-        final contentType = response.headers['content-type'] ?? '';
-        if (contentType.startsWith('image/')) {
-          final base64Image = base64Encode(response.bodyBytes);
-          return ['data:$contentType;base64,$base64Image'];
+    // If token exists, call HF inference API
+    if (_token.isNotEmpty) {
+      try {
+        final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
+        if (kIsWeb && _corsProxy.isEmpty) {
+          return ['🔒 En navegador (web) las peticiones a modelos de imágenes suelen bloquearse por CORS.\n' 
+                  'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.'];
         }
 
-        // If the API returns JSON with base64 (various shapes), be robust
-        final body = response.body;
-        try {
-          final decoded = json.decode(body);
-          // Common HF shapes: {"images": ["...base64..."]} or ["...base64..."]
-          if (decoded is Map && decoded.containsKey('images')) {
-            final imgs = decoded['images'];
-            if (imgs is List && imgs.isNotEmpty) {
-              return ['data:image/png;base64,${imgs[0]}'];
+        final url = kIsWeb && _corsProxy.isNotEmpty
+            ? '$_corsProxy${Uri.encodeFull(target)}'
+            : target;
+
+        final response = await http.post(
+          Uri.parse(url),
+          headers: _headers,
+          body: json.encode({
+            'inputs': prompt,
+            'parameters': {
+              'num_inference_steps': 20,
             }
-          }
-          if (decoded is List && decoded.isNotEmpty && decoded[0] is String) {
-            return ['data:image/png;base64,${decoded[0]}'];
-          }
-        } catch (_) {
-          // not JSON, continue
-        }
+          }),
+        ).timeout(const Duration(seconds: 60));
 
-        // Fallback: return textual response
-        return ['✅ Imagen generada (respuesta no binaria): ${response.body}'];
-      } else if (response.statusCode == 503) {
-        return ['⏳ El modelo de imágenes se está cargando. Esto puede tomar 30-60 segundos en la primera ejecución.'];
-      } else {
+        if (response.statusCode == 200) {
+          final contentType = response.headers['content-type'] ?? '';
+          if (contentType.startsWith('image/')) {
+            final base64Image = base64Encode(response.bodyBytes);
+            return ['data:$contentType;base64,$base64Image'];
+          }
+
+          final body = response.body;
+          try {
+            final decoded = json.decode(body);
+            if (decoded is Map && decoded.containsKey('images')) {
+              final imgs = decoded['images'];
+              if (imgs is List && imgs.isNotEmpty) {
+                return ['data:image/png;base64,${imgs[0]}'];
+              }
+            }
+            if (decoded is List && decoded.isNotEmpty && decoded[0] is String) {
+              return ['data:image/png;base64,${decoded[0]}'];
+            }
+          } catch (_) {}
+
+          return ['✅ Imagen generada (respuesta no binaria): ${response.body}'];
+        } else if (response.statusCode == 503) {
+          return ['⏳ El modelo de imágenes se está cargando. Esto puede tomar 30-60 segundos en la primera ejecución.'];
+        } else {
+          return await _generateImageWithProxy(prompt);
+        }
+      } catch (e) {
         return await _generateImageWithProxy(prompt);
       }
-    } catch (e) {
-      return await _generateImageWithProxy(prompt);
     }
+
+    // Fallback: mock image
+    return _mockImageResponse(prompt);
   }
 
   // Imágenes con proxy CORS
@@ -207,34 +241,53 @@ class HuggingFaceService {
 
   // ANÁLISIS DE SENTIMIENTOS REAL
   static Future<String> analyzeSentiment(String text) async {
-    try {
-      final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
-      if (kIsWeb && _corsProxy.isEmpty) {
-        return '🔒 En navegador (web) el análisis puede bloquearse por CORS.\n' 
-               'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.';
-      }
+    // Try HF Space first
+    if (_spaceUrl.isNotEmpty) {
+      try {
+        final resp = await _callSpace(_spaceUrl, [text]);
+        if (resp is Map && resp.containsKey('data')) {
+          final data = resp['data'];
+          if (data is List && data.isNotEmpty) {
+            final first = data[0];
+            return _parseSentiment(first is Map ? [first] : data);
+          }
+        }
+      } catch (_) {}
+    }
 
-      final url = kIsWeb && _corsProxy.isNotEmpty
-          ? '$_corsProxy${Uri.encodeFull(target)}'
-          : target;
+    if (_token.isNotEmpty) {
+      try {
+        final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
+        if (kIsWeb && _corsProxy.isEmpty) {
+          return '🔒 En navegador (web) el análisis puede bloquearse por CORS.\n' 
+                 'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.';
+        }
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': text,
-        }),
-      ).timeout(const Duration(seconds: 30));
+        final url = kIsWeb && _corsProxy.isNotEmpty
+            ? '$_corsProxy${Uri.encodeFull(target)}'
+            : target;
 
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        return _parseSentiment(data);
-      } else {
+        final response = await http.post(
+          Uri.parse(url),
+          headers: _headers,
+          body: json.encode({
+            'inputs': text,
+          }),
+        ).timeout(const Duration(seconds: 30));
+
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          return _parseSentiment(data);
+        } else {
+          return await _analyzeSentimentWithProxy(text);
+        }
+      } catch (e) {
         return await _analyzeSentimentWithProxy(text);
       }
-    } catch (e) {
-      return await _analyzeSentimentWithProxy(text);
     }
+
+    // Fallback mock
+    return _mockSentimentResponse(text);
   }
 
   // Sentimientos con proxy CORS
@@ -262,6 +315,39 @@ class HuggingFaceService {
       return '🔌 Error de conexión en análisis: $e';
     }
   }
+
+    // Generic caller for public Hugging Face Spaces that accept {"data": [inputs...]}
+    static Future<dynamic> _callSpace(String url, List<dynamic> inputs) async {
+      final response = await http.post(
+        Uri.parse(url),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'data': inputs}),
+      ).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        try {
+          return json.decode(response.body);
+        } catch (_) {
+          return response.body;
+        }
+      }
+      throw Exception('Space call failed: ${response.statusCode}');
+    }
+
+    // Mock/demo helpers used when no token/space is provided (useful for web demos)
+    static String _mockChatResponse(String prompt) {
+      return '🤖 (demo) Respuesta de ejemplo para: "$prompt"\n\nPuedes ejecutar en Android con un token real o configurar HF_SPACE_URL para usar un Space público.';
+    }
+
+    static List<String> _mockImageResponse(String prompt) {
+      // 1x1 PNG transparent base64 placeholder
+      const pixelBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=';
+      return ['data:image/png;base64,$pixelBase64'];
+    }
+
+    static String _mockSentimentResponse(String text) {
+      return '🎭 ANÁLISIS DE SENTIMIENTOS\n• Resultado: Neutral 😐\n• Confianza: 50%\n• Detalles: Modo demo.';
+    }
 
   static String _parseSentiment(dynamic data) {
     try {
