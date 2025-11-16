@@ -21,6 +21,31 @@ class HuggingFaceService {
     return headers;
   }
 
+  // Helper to POST to a target URL, routing through a proxy endpoint if configured.
+  // Supports two proxy styles:
+  // - Query-style proxies that expect the target appended after a `?`, e.g. `https://corsproxy.io/?`
+  // - JSON proxy endpoint that expects { url: target, data: ..., headers: ... } (our FastAPI proxy)
+  static Future<http.Response> _postToTarget(String target, dynamic payload) async {
+    if (_corsProxy.isNotEmpty) {
+      // If proxy appears to be a query-style proxy (contains '?'), append encoded target
+      if (_corsProxy.contains('?')) {
+        final url = '$_corsProxy${Uri.encodeFull(target)}';
+        return await http.post(Uri.parse(url), headers: _headers, body: json.encode(payload));
+      }
+
+      // Otherwise assume it's a JSON proxy endpoint (like our FastAPI /proxy)
+      final proxyBody = {
+        'url': target,
+        'data': payload,
+        'headers': _headers,
+      };
+      return await http.post(Uri.parse(_corsProxy), headers: {'Content-Type': 'application/json'}, body: json.encode(proxyBody));
+    }
+
+    // No proxy: call target directly
+    return await http.post(Uri.parse(target), headers: _headers, body: json.encode(payload));
+  }
+
   // CHAT REAL - Con manejo de HF Space, token y fallback mock
   static Future<String> generateText(String prompt) async {
     // If an HF Space URL is provided, call it (many public Spaces accept {"data":[input]})
@@ -46,25 +71,17 @@ class HuggingFaceService {
           return '🔒 En navegador (web) las peticiones a la API pueden bloquearse por CORS.\n\n' 
                  'Opciones:\n' 
                  '• Ejecuta la app en Android/iOS donde funciona la API.\n' 
-                 '• Provee un proxy CORS seguro y vuelve a compilar con: --dart-define=CORS_PROXY=https://your-proxy/?url=';
+                 '• Provee un proxy CORS seguro y vuelve a compilar con: --dart-define=CORS_PROXY=https://your-proxy/' ;
         }
 
-        final url = kIsWeb && _corsProxy.isNotEmpty
-            ? '$_corsProxy${Uri.encodeFull(target)}'
-            : target;
-
-        final response = await http.post(
-          Uri.parse(url),
-          headers: _headers,
-          body: json.encode({
-            'inputs': prompt,
-            'parameters': {
-              'max_length': 100,
-              'temperature': 0.9,
-              'do_sample': true,
-            }
-          }),
-        ).timeout(const Duration(seconds: 30));
+        final response = await _postToTarget(target, {
+          'inputs': prompt,
+          'parameters': {
+            'max_length': 100,
+            'temperature': 0.9,
+            'do_sample': true,
+          }
+        }).timeout(const Duration(seconds: 30));
 
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
@@ -83,40 +100,7 @@ class HuggingFaceService {
     return _mockChatResponse(prompt);
   }
 
-  // Chat con proxy CORS para web
-  static Future<String> _generateTextWithProxy(String prompt) async {
-    try {
-      final proxy = _corsProxy.isNotEmpty ? _corsProxy : 'https://corsproxy.io/?';
-      final target = '$_baseUrl/microsoft/DialoGPT-medium';
-      final url = '${proxy}${Uri.encodeFull(target)}';
-
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': prompt,
-          'parameters': {
-            'max_length': 100,
-            'temperature': 0.9,
-            'do_sample': true,
-          }
-        }),
-      ).timeout(const Duration(seconds: 30));
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        return data['generated_text'] ?? '🤖: ¡Hola! ¿En qué puedo ayudarte?';
-      } 
-      else if (response.statusCode == 503) {
-        return '⏳ El modelo de chat se está cargando. Por favor espera 20-30 segundos.';
-      }
-      else {
-        return '❌ Error temporal: ${response.statusCode}. Los servicios pueden estar ocupados.';
-      }
-    } catch (e) {
-      return '🔌 Error de conexión. Verifica tu internet o intenta en Android.';
-    }
-  }
+  // NOTE: _postToTarget ahora maneja el proxy; la lógica previa de proxy queda centralizada.
 
   // GENERACIÓN DE IMÁGENES REAL con visualización (soporta HF Space, token y mock)
   static Future<List<String>> generateImage(String prompt) async {
@@ -141,23 +125,15 @@ class HuggingFaceService {
         final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
         if (kIsWeb && _corsProxy.isEmpty) {
           return ['🔒 En navegador (web) las peticiones a modelos de imágenes suelen bloquearse por CORS.\n' 
-                  'Provee un proxy con --dart-define=CORS_PROXY=https://your-proxy/?url= o ejecuta en Android/iOS.'];
+                  'Provee un proxy con --dart-define=CORS_PROXY=http://localhost:7860/proxy o ejecuta en Android/iOS.'];
         }
 
-        final url = kIsWeb && _corsProxy.isNotEmpty
-            ? '$_corsProxy${Uri.encodeFull(target)}'
-            : target;
-
-        final response = await http.post(
-          Uri.parse(url),
-          headers: _headers,
-          body: json.encode({
-            'inputs': prompt,
-            'parameters': {
-              'num_inference_steps': 20,
-            }
-          }),
-        ).timeout(const Duration(seconds: 60));
+        final response = await _postToTarget(target, {
+          'inputs': prompt,
+          'parameters': {
+            'num_inference_steps': 20,
+          }
+        }).timeout(const Duration(seconds: 60));
 
         if (response.statusCode == 200) {
           final contentType = response.headers['content-type'] ?? '';
@@ -198,17 +174,8 @@ class HuggingFaceService {
   // Imágenes con proxy CORS
   static Future<List<String>> _generateImageWithProxy(String prompt) async {
     try {
-      final proxy = _corsProxy.isNotEmpty ? _corsProxy : 'https://corsproxy.io/?';
       final target = '$_baseUrl/runwayml/stable-diffusion-v1-5';
-      final url = '${proxy}${Uri.encodeFull(target)}';
-
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': prompt,
-        }),
-      ).timeout(const Duration(seconds: 60));
+      final response = await _postToTarget(target, {'inputs': prompt}).timeout(const Duration(seconds: 60));
 
       if (response.statusCode == 200) {
         final contentType = response.headers['content-type'] ?? '';
@@ -293,17 +260,8 @@ class HuggingFaceService {
   // Sentimientos con proxy CORS
   static Future<String> _analyzeSentimentWithProxy(String text) async {
     try {
-      final proxy = _corsProxy.isNotEmpty ? _corsProxy : 'https://corsproxy.io/?';
       final target = '$_baseUrl/cardiffnlp/twitter-roberta-base-sentiment-latest';
-      final url = '${proxy}${Uri.encodeFull(target)}';
-
-      final response = await http.post(
-        Uri.parse(url),
-        headers: _headers,
-        body: json.encode({
-          'inputs': text,
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final response = await _postToTarget(target, {'inputs': text}).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
